@@ -2,8 +2,8 @@
 
 import streamlit as st
 
-from . import similarity
-from .cli import find_similar
+from hearlike import similarity
+from hearlike.cli import find_similar
 
 st.set_page_config(page_title="hearlike", page_icon="🎧")
 st.title("🎧 hearlike")
