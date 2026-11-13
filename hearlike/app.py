@@ -1,6 +1,7 @@
 """Streamlit UI: python -m streamlit run hearlike/app.py"""
 
 import html
+import math
 
 import streamlit as st
 
@@ -83,7 +84,7 @@ st.markdown(
         font-size: 0.72rem; font-weight: 700; letter-spacing: 0.18em;
         color: #a78bfa; text-transform: uppercase; margin-bottom: 0.2rem;
     }
-    .hl-seed-title { font-size: 1.9rem; font-weight: 800; letter-spacing: -0.02em; line-height: 1.15; color: #f4f5fa; }
+    .hl-seed-title { font-size: 1.9rem; font-weight: 800; letter-spacing: -0.02em; line-height: 1.15; color: #f4f5fa; overflow-wrap: anywhere; }
     .hl-seed-sub { font-size: 1.0rem; color: #c9cdd8; margin-top: 0.15rem; }
     .hl-seed-meta { font-size: 0.85rem; color: #9aa0b4; margin-top: 0.1rem; }
     .hl-stats { display: flex; gap: 0.7rem; flex-wrap: wrap; margin: 1rem 0 0.4rem 0; }
@@ -101,10 +102,10 @@ st.markdown(
         background: linear-gradient(92deg, #a78bfa, #22d3ee);
         -webkit-background-clip: text; background-clip: text; margin-right: 0.45rem;
     }
-    .hl-track-title { font-size: 1.12rem; font-weight: 700; color: #f4f5fa; }
-    .hl-track-artist { font-size: 1.12rem; font-weight: 500; color: #b9bdd0; }
+    .hl-track-title { font-size: 1.12rem; font-weight: 700; color: #f4f5fa; overflow-wrap: anywhere; }
+    .hl-track-artist { font-size: 1.12rem; font-weight: 500; color: #b9bdd0; overflow-wrap: anywhere; }
     .hl-badge {
-        float: right; font-size: 0.8rem; font-weight: 700; color: #ffffff;
+        float: right; margin-left: 0.6rem; font-size: 0.8rem; font-weight: 700; color: #ffffff;
         background: linear-gradient(92deg, #8b5cf6, #06b6d4);
         border-radius: 999px; padding: 0.22rem 0.7rem; white-space: nowrap;
         box-shadow: 0 4px 14px rgba(139, 92, 246, 0.35);
@@ -167,6 +168,62 @@ def stat_block(label: str, value: str) -> str:
     )
 
 
+def _finite(value, default=None):
+    """value as a finite float, else default (guards NaN/missing features)."""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if math.isfinite(out) else default
+
+
+def _clamp01(value) -> float:
+    out = _finite(value, 0.0)
+    return min(max(out, 0.0), 1.0)
+
+
+def _fmt_bpm(feat: dict) -> str:
+    tempo = _finite(feat.get("tempo"))
+    return f"{tempo:.0f} BPM" if tempo is not None else "— BPM"
+
+
+def _fmt_energy(feat: dict) -> str:
+    energy = _finite(feat.get("energy"))
+    return f"{energy:.3f}" if energy is not None else "—"
+
+
+def _norm(text: str) -> str:
+    return "".join(ch for ch in (text or "").lower() if ch.isalnum())
+
+
+def dedupe_ranked(ranked: list, seed) -> list:
+    """Drop display-level duplicates: the same song on a different album has
+    a different trackId, so the pool builder can't catch it — and the seed
+    itself can reappear that way. Ranked is best-first, so first wins."""
+    seen = {(_norm(seed.title), _norm(seed.artist))}
+    unique = []
+    for item in ranked:
+        key = (_norm(item[0].title), _norm(item[0].artist))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
+def show_artwork(track) -> None:
+    """Artwork with graceful fallbacks: hi-res, then original, then a tile."""
+    for url in (hi_res(track.artwork), track.artwork):
+        if not url:
+            continue
+        try:
+            st.image(url, use_container_width=True)
+            return
+        except Exception:
+            continue
+    st.markdown('<div class="hl-art-fallback">🎵</div>', unsafe_allow_html=True)
+
+
 # ---------------------------------------------------------------------------
 # Sidebar controls
 # ---------------------------------------------------------------------------
@@ -213,15 +270,30 @@ st.markdown(
 # Search (results cached in session state so widget reruns don't re-run it)
 # ---------------------------------------------------------------------------
 if go:
-    queries = [q.strip() for q in extra.split(",") if q.strip()]
-    with st.spinner("Listening to previews… (first run analyzes each candidate)"):
-        try:
-            st.session_state["hl_result"] = find_similar(
-                title, artist or None, queries, limit, pool_cap=40
-            )
-            st.session_state["hl_error"] = None
-        except SystemExit as e:
-            st.session_state["hl_error"] = str(e)
+    title = title.strip()
+    artist = artist.strip()
+    if not title:
+        st.session_state["hl_result"] = None
+        st.session_state["hl_error"] = "Type a song name in the sidebar first."
+    else:
+        queries = [q.strip() for q in extra.split(",") if q.strip()]
+        # Clear the previous result up front so a failed search never leaves
+        # stale cards sitting under the new error.
+        st.session_state["hl_result"] = None
+        with st.spinner("Listening to previews… (first run analyzes each candidate)"):
+            try:
+                st.session_state["hl_result"] = find_similar(
+                    title, artist or None, queries, limit, pool_cap=40
+                )
+                st.session_state["hl_error"] = None
+                st.session_state["hl_search_key"] = (title, artist, extra, limit)
+            except SystemExit as e:
+                st.session_state["hl_error"] = str(e) or "That search failed."
+            except Exception:
+                st.session_state["hl_error"] = (
+                    "Something went wrong while searching — check your "
+                    "connection and try again."
+                )
 
 error = st.session_state.get("hl_error")
 result = st.session_state.get("hl_result")
@@ -236,22 +308,17 @@ if result:
     with st.container(border=True):
         art_col, info_col = st.columns([1, 2.6])
         with art_col:
-            if seed.artwork:
-                st.image(hi_res(seed.artwork), use_container_width=True)
-            else:
-                st.markdown(
-                    '<div class="hl-art-fallback">🎵</div>', unsafe_allow_html=True
-                )
+            show_artwork(seed)
         with info_col:
             st.markdown(
                 '<div class="hl-eyebrow">Seed track</div>', unsafe_allow_html=True
             )
             st.markdown(
-                f'<div class="hl-seed-title">{html.escape(seed.title)}</div>',
+                f'<div class="hl-seed-title">{html.escape(seed.title or "Unknown title")}</div>',
                 unsafe_allow_html=True,
             )
             st.markdown(
-                f'<div class="hl-seed-sub">{html.escape(seed.artist)}</div>',
+                f'<div class="hl-seed-sub">{html.escape(seed.artist or "Unknown artist")}</div>',
                 unsafe_allow_html=True,
             )
             meta_bits = [b for b in (seed.album, seed.genre) if b]
@@ -262,14 +329,13 @@ if result:
                     unsafe_allow_html=True,
                 )
             stats = [
-                stat_block("Tempo", f"{seed_feat['tempo']:.0f} BPM"),
-                stat_block("Key", html.escape(str(seed_feat["key"]))),
-                stat_block("Energy", f"{seed_feat['energy']:.3f}"),
+                stat_block("Tempo", _fmt_bpm(seed_feat)),
+                stat_block("Key", html.escape(str(seed_feat.get("key") or "—"))),
+                stat_block("Energy", _fmt_energy(seed_feat)),
             ]
-            if seed_feat.get("brightness") is not None:
-                stats.append(
-                    stat_block("Brightness", f"{seed_feat['brightness']:,.0f} Hz")
-                )
+            brightness = _finite(seed_feat.get("brightness"))
+            if brightness is not None:
+                stats.append(stat_block("Brightness", f"{brightness:,.0f} Hz"))
             st.markdown(
                 f'<div class="hl-stats">{"".join(stats)}</div>',
                 unsafe_allow_html=True,
@@ -280,40 +346,49 @@ if result:
                 st.caption("No preview available for the seed track.")
 
     # --- Results -----------------------------------------------------------
+    ranked = dedupe_ranked(ranked, seed)
     st.markdown("### Closest matches")
     st.caption(
         f"{len(ranked)} songs ranked by audio similarity to {seed.label()} — "
         "open “Why this match” on any card to see the component breakdown."
     )
+    if st.session_state.get("hl_search_key") not in (
+        None,
+        (title.strip(), artist.strip(), extra, limit),
+    ):
+        st.caption("ℹ️ Search settings changed — press **Find similar** to refresh these results.")
 
     if not ranked:
         st.info("No candidates were found for that search — try widening the extra searches.")
 
     for rank, (track, feat, score, comps) in enumerate(ranked, start=1):
-        reasons = similarity.explain(seed_feat, feat, comps)
+        score = _finite(score, 0.0)
+        try:
+            reasons = similarity.explain(seed_feat, feat, comps)
+        except Exception:
+            reasons = ["closest overall match in the pool"]
         with st.container(border=True):
             art_col, main_col = st.columns([1, 6])
             with art_col:
-                if track.artwork:
-                    st.image(hi_res(track.artwork), use_container_width=True)
-                else:
-                    st.markdown(
-                        '<div class="hl-art-fallback">🎵</div>',
-                        unsafe_allow_html=True,
-                    )
+                show_artwork(track)
             with main_col:
                 st.markdown(
                     f'<span class="hl-badge">{score:.0f}% match</span>'
                     f'<span class="hl-rank">#{rank}</span>'
-                    f'<span class="hl-track-title">{html.escape(track.title)}</span>'
-                    f' <span class="hl-track-artist">— {html.escape(track.artist)}</span>',
+                    f'<span class="hl-track-title">{html.escape(track.title or "Unknown title")}</span>'
+                    f' <span class="hl-track-artist">— {html.escape(track.artist or "Unknown artist")}</span>',
                     unsafe_allow_html=True,
                 )
-                st.progress(min(max(score / 100.0, 0.0), 1.0))
+                st.progress(_clamp01(score / 100.0))
+                meta_bits = [
+                    _fmt_bpm(feat),
+                    html.escape(str(feat.get("key") or "—")),
+                    f"energy {_fmt_energy(feat)}",
+                ]
+                if track.album:
+                    meta_bits.append(html.escape(track.album))
                 st.markdown(
-                    f'<div class="hl-meta">{feat["tempo"]:.0f} BPM · '
-                    f'{html.escape(str(feat["key"]))} · energy {feat["energy"]:.3f}'
-                    f' · {html.escape(track.album)}</div>',
+                    f'<div class="hl-meta">{" · ".join(meta_bits)}</div>',
                     unsafe_allow_html=True,
                 )
                 chips = "".join(
@@ -328,10 +403,10 @@ if result:
                         "(share of the overall score in parentheses)."
                     )
                     for comp_key, comp_label, comp_weight in COMPONENTS:
-                        dist = comps.get(comp_key)
+                        dist = _finite(comps.get(comp_key))
                         if dist is None:
                             continue
-                        closeness = min(max(1.0 - float(dist), 0.0), 1.0)
+                        closeness = _clamp01(1.0 - dist)
                         st.progress(
                             closeness,
                             text=f"{comp_label} — {closeness:.0%} alike ({comp_weight}% of score)",
